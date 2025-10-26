@@ -1,0 +1,38 @@
+questions:
+  - text: "What year was Red Hat founded?"
+    options: ["1991", "1993", "1999", "2001"]
+    answer: 1
+    note: "History round!"
+  - text: "Red Hat’s first product (1.0) was nicknamed…"
+    options: ["Hat Trick", "Mother’s Day", "Fedora First", "Open Future"]
+    answer: 1
+  - text: "OpenShift builds on which upstream project?"
+    options: ["Mesos", "Docker Swarm", "Kubernetes", "Nomad"]
+    answer: 2
+  - text: "Smallest deployable unit in OpenShift?"
+    options: ["Container", "Pod", "Deployment", "Node"]
+    answer: 1
+  - text: "Main advantage of Operators?"
+    options: ["Cheaper VMs", "Automated app lifecycle", "Faster disks", "Better CLI colors"]
+    answer: 1
+  - text: "What does a Route do in OpenShift?"
+    options: ["Scale pods", "Grant cluster admin", "Expose a service externally", "Restart nodes"]
+    answer: 2
+  - text: "Open source ‘four freedoms’ are about the freedom to use, study, modify, and…"
+    options: ["Monetize", "Comply", "Share", "Encrypt"]
+    answer: 2
+  - text: "What does “upstream first” mean?"
+    options: ["Ship closed first", "Contribute to community project before productizing", "Fork then forget", "Marketing term only"]
+    answer: 1
+  - text: "Community distribution of OpenShift is called…"
+    options: ["OKD", "Minishift", "MicroShift", "OpenHat"]
+    answer: 0
+  - text: "`oc` is to OpenShift as `____` is to Kubernetes."
+    options: ["helm", "kubectl", "kubeadm", "kustomize"]
+    answer: 1
+  - text: "A pod repeatedly failing typically shows which status?"
+    options: ["Running", "Completed", "CrashLoopBackOff", "ImagePullBackOn"]
+    answer: 2
+  - text: "Red Hat Summit is primarily a…"
+    options: ["Gaming expo", "Music festival", "Open source conference", "Sports meetup"]
+    answer: 2
