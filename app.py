@@ -9,6 +9,7 @@ PLAYERS = set()                 # canonical display names
 NAME_INDEX = {}                 # lowercased -> canonical
 SCORES = defaultdict(int)       # canonical -> score
 SUBMITTED = set()               # canonical submitted this question
+CURRENT_ANSWERS = {}            # canonical -> selected option index (or None)
 LAST_SUBMISSION_TS = {}         # canonical -> float
 PHASE = "lobby"                 # lobby | question | answer | reveal | final
 CURRENT_INDEX = -1              # -1 in lobby; 0..N-1 during quiz
@@ -87,7 +88,7 @@ INDEX_HTML = """
     .leaderboard { font-variant-numeric:tabular-nums; }
     .winner { background: #fff3cd; border: 1px solid #ffe69c; padding: 8px; border-radius: 8px; }
     .error { color:#b00020; margin-left:10px; font-size: 90%; }
-    .correct { outline: 2px solid #198754; border-radius: 6px; padding: 2px 6px; }
+    .user-choice { outline: 2px solid #0d6efd; border-radius: 6px; padding: 2px 6px; }
     .disabled { opacity: 0.7; pointer-events: none; }
   </style>
 </head>
@@ -147,6 +148,8 @@ async function register(){
   }
 }
 
+function lsKeyFor(idx){ return 'ans_q_'+idx; }
+
 async function loadState(){
   const r = await fetch('/api/state');
   state = await r.json();
@@ -154,18 +157,19 @@ async function loadState(){
 }
 
 function renderQuestion(readonly){
-  const qc = document.getElementById('questionCard');
+  const qc = el('questionCard');
   const Q = state.question;
   if(!Q){ qc.style.display='none'; return; }
   qc.style.display='block';
 
-  const correctIdx = state.correct_answer_index; // only present in 'answer' phase
+  // user's previously submitted answer for this question (from localStorage)
+  const savedAns = localStorage.getItem(lsKeyFor(state.current_index));
+  const savedIdx = savedAns !== null ? parseInt(savedAns) : null;
+
   const opts = Q.options.map((o,i)=>{
-    const isCorrect = (correctIdx !== undefined && correctIdx === i);
-    const cls = isCorrect ? 'correct' : '';
+    const userCls = (savedIdx !== null && savedIdx === i) ? 'user-choice' : '';
     const disabled = readonly ? 'disabled' : '';
-    // NOTE: no "checked" attribute anywhere -> nothing is selected by default
-    return `<label class="${cls}" style="display:block;margin:4px 0;">
+    return `<label class="${userCls}" style="display:block;margin:4px 0;">
               <input type="radio" name="opt" value="${i}" ${disabled}> ${o}
             </label>`;
   }).join('');
@@ -180,8 +184,13 @@ function renderQuestion(readonly){
     ${Q.note ? `<div class="muted" style="margin-top:8px;">💡 ${Q.note}</div>` : ''}
   `;
 
-  // EXTRA SAFETY: explicitly clear any accidental selection (e.g., browser autofill/restore)
+  // Nothing selected by default; explicitly ensure radios start unchecked.
   Array.from(qc.querySelectorAll('input[name="opt"]')).forEach(r => { r.checked = false; });
+  // If user had an answer and we're still in question phase, pre-check it for convenience
+  if(!readonly && savedIdx !== null){
+    const toCheck = qc.querySelector('input[name="opt"][value="'+savedIdx+'"]');
+    if(toCheck) toCheck.checked = true;
+  }
 }
 
 function renderState(){
@@ -213,7 +222,7 @@ function renderState(){
     return;
   }
 
-  if(state.phase === 'answer'){ // show correct answer, inputs locked
+  if(state.phase === 'answer'){ // show user's own answer highlighted, inputs locked
     if(currentKey !== lastRenderKey){
       renderQuestion(true);
       lb.style.display='none';
@@ -253,8 +262,10 @@ async function submitAnswer(){
   });
   const data = await r.json();
   const s = el('submitStatus');
+  // No "correct!" message — if accepted, either show neutral Saved (if wrong) or nothing (if correct)
   if(r.ok && data.accepted){
-    // If correct, show NOTHING (per requirement)
+    // persist my answer for highlight across phases/page refresh
+    if(chosen){ localStorage.setItem(lsKeyFor(state.current_index), String(answer)); }
     if(data.correct){
       s.style.display='none';
     }else{
@@ -262,6 +273,8 @@ async function submitAnswer(){
       s.className='badge warn';
       s.textContent = 'Saved';
     }
+    // re-render to apply highlight class immediately
+    renderQuestion(false);
   } else {
     s.style.display='inline-block';
     s.className='badge warn';
@@ -305,37 +318,90 @@ ADMIN_HTML = """
     .primary { background:#ee0000; color:#fff; }
     .secondary { background:#f2f2f2; }
     code { background:#f6f6f6; padding:2px 6px; border-radius:6px; }
+    .correct { outline: 2px solid #198754; border-radius: 6px; padding: 2px 6px; }
+    .status { margin-top:8px; font-size: 90%; color:#333; }
+    .muted { color:#555; }
   </style>
 </head>
 <body>
   <h2>☸️ Quiz Admin</h2>
+
   <div class="card" id="state"></div>
+
   <div class="card">
     <button class="primary" onclick="post('/api/admin/start')">Start</button>
     <button class="secondary" onclick="post('/api/admin/advance')">Advance</button>
     <button onclick="post('/api/admin/reset')">Reset</button>
+    <div id="status" class="status muted">Ready.</div>
   </div>
+
+  <div class="card" id="adminQuestion"></div>
+
   <div class="card">
-    <div>Flow: Question → Answer (shows correct) → Leaderboard → Next</div>
-    <div>Project <code>/api/leaderboard</code> to the screen for the reveal round.</div>
+    <div>Leaderboard (use below for reveal/final)</div>
+    <div id="adminLeaderboard" class="muted">Waiting…</div>
   </div>
+
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
+
 async function post(url){
-  const r = await fetch(url+'?token='+encodeURIComponent(token), {method:'POST'});
-  const data = await r.json();
-  await load();
-  alert(data.message || 'OK');
+  const statusEl = document.getElementById('status');
+  try{
+    const r = await fetch(url+'?token='+encodeURIComponent(token), {method:'POST'});
+    const data = await r.json();
+    await loadEverything();
+    statusEl.textContent = (data && data.message) ? data.message : (r.ok ? 'OK' : 'Error');
+  }catch(e){
+    statusEl.textContent = 'Request failed.';
+  }
 }
-async function load(){
+
+async function loadEverything(){
+  await Promise.all([loadState(), loadAdminState(), loadLeaderboard()]);
+}
+
+async function loadState(){
   const r = await fetch('/api/state');
   const s = await r.json();
   document.getElementById('state').innerHTML =
     `<div><strong>Phase:</strong> ${s.phase.toUpperCase()} · Q ${s.current_index>=0?s.current_index+1:0}/${s.total_questions}</div>
      <div><strong>Players:</strong> ${s.players_count} · <strong>Submissions:</strong> ${s.submissions_count}</div>`;
 }
-setInterval(load, 2000);
-load();
+
+async function loadAdminState(){
+  const r = await fetch('/api/admin_state?token='+encodeURIComponent(token));
+  if(!r.ok){ document.getElementById('adminQuestion').innerHTML = '<em>Not authorized or unavailable.</em>'; return; }
+  const a = await r.json();
+  const q = a.question;
+  if(!q){ document.getElementById('adminQuestion').innerHTML = '<em>No question loaded.</em>'; return; }
+
+  // Show question and mark correct answer ONLY during ANSWER phase
+  let opts = q.options.map((o,i)=>{
+    const cls = (a.phase === 'answer' && a.correct_answer_index === i) ? 'correct' : '';
+    return `<div class="${cls}" style="margin:4px 0;">${i+1}. ${o}</div>`;
+  }).join('');
+
+  document.getElementById('adminQuestion').innerHTML =
+    `<div><strong>Question ${a.current_index+1}:</strong> ${q.text}</div>
+     ${q.note ? `<div class="muted" style="margin-top:4px;">💡 ${q.note}</div>` : ''}
+     <div style="margin-top:8px;">${opts}</div>`;
+}
+
+async function loadLeaderboard(){
+  const r = await fetch('/api/leaderboard');
+  const data = await r.json();
+  const winners = data.winners || [];
+  const max = data.max_score ?? 0;
+  document.getElementById('adminLeaderboard').innerHTML =
+    data.rows.map((row, i) => {
+      const crown = (winners.includes(row.name) && (max>0) && document.getElementById('state').innerText.includes('FINAL')) ? ' 🏆' : '';
+      return `<div>${i+1}. <strong>${row.name}</strong> — ${row.score}${crown}</div>`;
+    }).join('') || '<em>No scores yet.</em>';
+}
+
+setInterval(loadEverything, 2000);
+loadEverything();
 </script>
 </body>
 </html>
@@ -371,17 +437,36 @@ def api_register():
 
 @app.route("/api/state")
 def api_state():
+    # Public state for participants (NO CORRECT ANSWER LEAKED)
+    qs = load_questions()
+    q = current_question()
+    q_pub = None
+    if q:
+        q_pub = {"text": q.get("text"), "options": q.get("options", []), "note": q.get("note")}
+    return jsonify({
+        "phase": PHASE,
+        "current_index": CURRENT_INDEX,
+        "total_questions": len(qs),
+        "players_count": len(PLAYERS),
+        "submissions_count": len(SUBMITTED),
+        "question": q_pub
+    })
+
+@app.route("/api/admin_state")
+def api_admin_state():
+    # Detailed state for facilitator (includes correct answer)
+    if ADMIN_TOKEN and request.args.get("token") != ADMIN_TOKEN:
+        return abort(403)
     qs = load_questions()
     q = current_question()
     q_pub = None
     correct_index = None
     if q:
         q_pub = {"text": q.get("text"), "options": q.get("options", []), "note": q.get("note")}
-        if PHASE == "answer":  # expose correct answer only in answer phase
-            try:
-                correct_index = int(q.get("answer"))
-            except Exception:
-                correct_index = None
+        try:
+            correct_index = int(q.get("answer"))
+        except Exception:
+            correct_index = None
     return jsonify({
         "phase": PHASE,
         "current_index": CURRENT_INDEX,
@@ -395,7 +480,7 @@ def api_state():
 @app.route("/api/submit", methods=["POST"])
 def api_submit():
     """Accept one answer per player for current question. Correct=+1, wrong/missing=0."""
-    global SUBMITTED
+    global SUBMITTED, CURRENT_ANSWERS
     if PHASE != "question":
         return jsonify({"accepted": False, "message": "Not accepting answers now"}), 400
     payload = request.get_json(force=True)
@@ -413,9 +498,12 @@ def api_submit():
         return jsonify({"accepted": False, "message": "Already submitted"}), 200
 
     q = current_question()
+    answer = payload.get("answer", None)
+    CURRENT_ANSWERS[canonical] = answer
+
     correct = False
     try:
-        if payload.get("answer") == q["answer"]:
+        if answer == q["answer"]:
             correct = True
             SCORES[canonical] += 1
     except Exception:
@@ -423,7 +511,7 @@ def api_submit():
 
     SUBMITTED.add(canonical)
 
-    # Auto-advance to ANSWER (show correct) when everyone submitted
+    # Auto-advance to ANSWER (show correct on admin) when everyone submitted
     if len(PLAYERS) > 0 and len(SUBMITTED) >= len(PLAYERS):
         _advance_to_answer()
 
@@ -444,9 +532,10 @@ def _require_admin():
         abort(403)
 
 def _advance_to_question():
-    global PHASE, SUBMITTED
+    global PHASE, SUBMITTED, CURRENT_ANSWERS
     PHASE = "question"
     SUBMITTED = set()
+    CURRENT_ANSWERS = {}
 
 def _advance_to_answer():
     global PHASE
@@ -463,10 +552,11 @@ def _advance_to_final():
 @app.route("/api/admin/start", methods=["POST"])
 def api_admin_start():
     _require_admin()
-    global PHASE, CURRENT_INDEX, SCORES, SUBMITTED
+    global PHASE, CURRENT_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS
     qs = load_questions()
     SCORES = defaultdict(int, {name: 0 for name in PLAYERS})
     SUBMITTED = set()
+    CURRENT_ANSWERS = {}
     CURRENT_INDEX = 0 if len(qs) > 0 else -1
     PHASE = "question" if CURRENT_INDEX >= 0 else "final"
     return jsonify({"ok": True, "message": "Quiz started"})
@@ -498,10 +588,11 @@ def api_admin_advance():
 @app.route("/api/admin/reset", methods=["POST"])
 def api_admin_reset():
     _require_admin()
-    global PHASE, CURRENT_INDEX, PLAYERS, NAME_INDEX, SCORES, SUBMITTED, LAST_SUBMISSION_TS
+    global PHASE, CURRENT_INDEX, PLAYERS, NAME_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS, LAST_SUBMISSION_TS
     PHASE = "lobby"
     CURRENT_INDEX = -1
     SUBMITTED = set()
+    CURRENT_ANSWERS = {}
     LAST_SUBMISSION_TS = {}
     SCORES = defaultdict(int, {name: 0 for name in PLAYERS})
     return jsonify({"ok": True, "message": "Reset to lobby"})
