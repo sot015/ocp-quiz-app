@@ -5,13 +5,12 @@ from collections import defaultdict
 app = Flask(__name__)
 
 # === In-memory state (pod-local). ===
-# We keep a canonical "display name" and a case-insensitive index to prevent duplicates.
 PLAYERS = set()                 # canonical display names
-NAME_INDEX = {}                 # lowercased -> canonical display name
-SCORES = defaultdict(int)       # canonical name -> score
-SUBMITTED = set()               # canonical names who submitted current question
-LAST_SUBMISSION_TS = {}         # canonical name -> float
-PHASE = "lobby"                 # lobby | question | reveal | final
+NAME_INDEX = {}                 # lowercased -> canonical
+SCORES = defaultdict(int)       # canonical -> score
+SUBMITTED = set()               # canonical submitted this question
+LAST_SUBMISSION_TS = {}         # canonical -> float
+PHASE = "lobby"                 # lobby | question | answer | reveal | final
 CURRENT_INDEX = -1              # -1 in lobby; 0..N-1 during quiz
 
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
@@ -32,34 +31,28 @@ def current_question():
 
 def winners():
     if not SCORES:
-        return []
+        return [], 0
     mx = max(SCORES.values())
     return [n for (n, s) in SCORES.items() if s == mx], mx
 
 _ws_collapse = re.compile(r"\s+")
 def normalize_name(name: str) -> str:
-    """Trim, collapse inner whitespace, casefold for duplicate detection."""
     name = (name or "").strip()
     name = _ws_collapse.sub(" ", name)
-    # Disallow empty, too long, or purely punctuation
     if not name or len(name) > 40:
         return ""
     return name
 
 def to_canonical(submitted_name: str):
-    """Returns (ok, canonical or error message)."""
     name = normalize_name(submitted_name)
     if not name:
         return False, "Invalid name"
     lower = name.casefold()
-    # If the lowercased exists, return canonical for consistency
     if lower in NAME_INDEX:
         return True, NAME_INDEX[lower]
-    # If brand new and we're just mapping to canonical, return the cleaned version
-    return True, name
+    return False, "Please register first"
 
 def ensure_unique_on_register(requested_name: str):
-    """Enforce unique, case-insensitive names on registration."""
     nm = normalize_name(requested_name)
     if not nm:
         return False, "Name required"
@@ -94,6 +87,8 @@ INDEX_HTML = """
     .leaderboard { font-variant-numeric:tabular-nums; }
     .winner { background: #fff3cd; border: 1px solid #ffe69c; padding: 8px; border-radius: 8px; }
     .error { color:#b00020; margin-left:10px; font-size: 90%; }
+    .correct { outline: 2px solid #198754; border-radius: 6px; padding: 2px 6px; }
+    .disabled { opacity: 0.7; pointer-events: none; }
   </style>
 </head>
 <body>
@@ -131,7 +126,7 @@ INDEX_HTML = """
 <script>
 let state = null;
 let myName = localStorage.getItem('quiz_name') || '';
-let lastRenderKey = ""; // phase:index to avoid re-rendering question block
+let lastRenderKey = ""; // phase:index
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value.trim(); }
@@ -158,6 +153,37 @@ async function loadState(){
   renderState();
 }
 
+function renderQuestion(readonly){
+  const qc = document.getElementById('questionCard');
+  const Q = state.question;
+  if(!Q){ qc.style.display='none'; return; }
+  qc.style.display='block';
+
+  const correctIdx = state.correct_answer_index; // only present in 'answer' phase
+  const opts = Q.options.map((o,i)=>{
+    const isCorrect = (correctIdx !== undefined && correctIdx === i);
+    const cls = isCorrect ? 'correct' : '';
+    const disabled = readonly ? 'disabled' : '';
+    // NOTE: no "checked" attribute anywhere -> nothing is selected by default
+    return `<label class="${cls}" style="display:block;margin:4px 0;">
+              <input type="radio" name="opt" value="${i}" ${disabled}> ${o}
+            </label>`;
+  }).join('');
+
+  qc.innerHTML = `
+    <div class="qtitle">${state.current_index+1}. ${Q.text}</div>
+    ${opts}
+    <div style="margin-top:8px;">
+      ${readonly ? '' : '<button class="primary" onclick="submitAnswer()">Submit</button>'}
+      <span id="submitStatus" class="badge warn" style="display:none"></span>
+    </div>
+    ${Q.note ? `<div class="muted" style="margin-top:8px;">💡 ${Q.note}</div>` : ''}
+  `;
+
+  // EXTRA SAFETY: explicitly clear any accidental selection (e.g., browser autofill/restore)
+  Array.from(qc.querySelectorAll('input[name="opt"]')).forEach(r => { r.checked = false; });
+}
+
 function renderState(){
   const pc = el('phaseCard');
   const qc = el('questionCard');
@@ -165,7 +191,6 @@ function renderState(){
 
   if(!val('player') && myName){ el('player').value = myName; }
 
-  // Always update phase banner counts (cheap, non-destructive)
   pc.innerHTML = `<strong>Phase:</strong> ${state.phase.toUpperCase()} ·
     Question ${state.current_index >= 0 ? state.current_index+1 : 0} / ${state.total_questions} ·
     Players: ${state.players_count} · Submissions: ${state.submissions_count}`;
@@ -180,45 +205,24 @@ function renderState(){
   }
 
   if(state.phase === 'question'){
-    // Only render the question panel if phase/index changed
     if(currentKey !== lastRenderKey){
-      const Q = state.question;
-      if(Q){
-        qc.style.display='block';
-        const existingSelection = document.querySelector('input[name="opt"]:checked');
-        const selectedVal = existingSelection ? existingSelection.value : null;
-
-        const opts = Q.options.map((o,i)=>
-          `<label style="display:block;margin:4px 0;">
-            <input type="radio" name="opt" value="${i}"> ${o}
-          </label>`).join('');
-        qc.innerHTML = `
-          <div class="qtitle">${state.current_index+1}. ${Q.text}</div>
-          ${opts}
-          <div style="margin-top:8px;">
-            <button class="primary" onclick="submitAnswer()">Submit</button>
-            <span id="submitStatus" class="badge warn" style="display:none"></span>
-          </div>
-          ${Q.note ? `<div class="muted" style="margin-top:8px;">💡 ${Q.note}</div>` : ''}
-        `;
-
-        // If we had a selection and the question didn't actually change (defensive),
-        // try to restore it. (When index changed, this will simply not match and do nothing.)
-        if(selectedVal !== null){
-          const toCheck = document.querySelector('input[name="opt"][value="'+selectedVal+'"]');
-          if(toCheck) toCheck.checked = true;
-        }
-      } else {
-        qc.style.display='none';
-      }
+      renderQuestion(false); // answerable
       lb.style.display='none';
       lastRenderKey = currentKey;
     }
     return;
   }
 
-  if(state.phase === 'reveal'){
-    // Only render leaderboard once per phase/index
+  if(state.phase === 'answer'){ // show correct answer, inputs locked
+    if(currentKey !== lastRenderKey){
+      renderQuestion(true);
+      lb.style.display='none';
+      lastRenderKey = currentKey;
+    }
+    return;
+  }
+
+  if(state.phase === 'reveal'){ // leaderboard
     if(currentKey !== lastRenderKey){
       qc.style.display='none';
       loadLeaderboard(false);
@@ -249,11 +253,17 @@ async function submitAnswer(){
   });
   const data = await r.json();
   const s = el('submitStatus');
-  s.style.display='inline-block';
   if(r.ok && data.accepted){
-    s.className='badge ok';
-    s.textContent = data.correct ? 'Saved! Correct ✅' : 'Saved';
+    // If correct, show NOTHING (per requirement)
+    if(data.correct){
+      s.style.display='none';
+    }else{
+      s.style.display='inline-block';
+      s.className='badge warn';
+      s.textContent = 'Saved';
+    }
   } else {
+    s.style.display='inline-block';
     s.className='badge warn';
     s.textContent = data.message || 'Not accepted';
   }
@@ -302,11 +312,12 @@ ADMIN_HTML = """
   <div class="card" id="state"></div>
   <div class="card">
     <button class="primary" onclick="post('/api/admin/start')">Start</button>
-    <button class="secondary" onclick="post('/api/admin/advance')">Advance (Reveal / Next / Final)</button>
+    <button class="secondary" onclick="post('/api/admin/advance')">Advance</button>
     <button onclick="post('/api/admin/reset')">Reset</button>
   </div>
   <div class="card">
-    <div>Leaderboard (project <code>/api/leaderboard</code> on screen)</div>
+    <div>Flow: Question → Answer (shows correct) → Leaderboard → Next</div>
+    <div>Project <code>/api/leaderboard</code> to the screen for the reveal round.</div>
   </div>
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
@@ -355,7 +366,7 @@ def api_register():
     lower = canonical.casefold()
     PLAYERS.add(canonical)
     NAME_INDEX[lower] = canonical
-    SCORES[canonical] = SCORES[canonical]  # ensure key exists
+    SCORES[canonical] = SCORES[canonical]
     return jsonify({"ok": True})
 
 @app.route("/api/state")
@@ -363,15 +374,22 @@ def api_state():
     qs = load_questions()
     q = current_question()
     q_pub = None
+    correct_index = None
     if q:
         q_pub = {"text": q.get("text"), "options": q.get("options", []), "note": q.get("note")}
+        if PHASE == "answer":  # expose correct answer only in answer phase
+            try:
+                correct_index = int(q.get("answer"))
+            except Exception:
+                correct_index = None
     return jsonify({
         "phase": PHASE,
         "current_index": CURRENT_INDEX,
         "total_questions": len(qs),
         "players_count": len(PLAYERS),
         "submissions_count": len(SUBMITTED),
-        "question": q_pub
+        "question": q_pub,
+        "correct_answer_index": correct_index
     })
 
 @app.route("/api/submit", methods=["POST"])
@@ -381,15 +399,10 @@ def api_submit():
     if PHASE != "question":
         return jsonify({"accepted": False, "message": "Not accepting answers now"}), 400
     payload = request.get_json(force=True)
-    submitted_name = (payload.get("name") or "")
-    ok, canon_or_msg = to_canonical(submitted_name)
+    ok, canon_or_msg = to_canonical(payload.get("name"))
     if not ok:
         return jsonify({"accepted": False, "message": canon_or_msg}), 400
     canonical = canon_or_msg
-    lower = canonical.casefold()
-    if lower not in NAME_INDEX:
-        return jsonify({"accepted": False, "message": "Please register first"}), 400
-    canonical = NAME_INDEX[lower]
 
     now = time.time()
     if canonical in LAST_SUBMISSION_TS and (now - LAST_SUBMISSION_TS[canonical] < 0.8):
@@ -410,9 +423,9 @@ def api_submit():
 
     SUBMITTED.add(canonical)
 
-    # auto-reveal if all registered players submitted
+    # Auto-advance to ANSWER (show correct) when everyone submitted
     if len(PLAYERS) > 0 and len(SUBMITTED) >= len(PLAYERS):
-        _advance_to_reveal()
+        _advance_to_answer()
 
     return jsonify({"accepted": True, "correct": correct})
 
@@ -435,6 +448,10 @@ def _advance_to_question():
     PHASE = "question"
     SUBMITTED = set()
 
+def _advance_to_answer():
+    global PHASE
+    PHASE = "answer"
+
 def _advance_to_reveal():
     global PHASE
     PHASE = "reveal"
@@ -448,7 +465,6 @@ def api_admin_start():
     _require_admin()
     global PHASE, CURRENT_INDEX, SCORES, SUBMITTED
     qs = load_questions()
-    # reset scores for registered players only
     SCORES = defaultdict(int, {name: 0 for name in PLAYERS})
     SUBMITTED = set()
     CURRENT_INDEX = 0 if len(qs) > 0 else -1
@@ -458,11 +474,14 @@ def api_admin_start():
 @app.route("/api/admin/advance", methods=["POST"])
 def api_admin_advance():
     _require_admin()
-    global PHASE, CURRENT_INDEX, SUBMITTED
+    global PHASE, CURRENT_INDEX
     qs = load_questions()
     if PHASE == "question":
+        _advance_to_answer()
+        return jsonify({"ok": True, "message": "Showing correct answer"})
+    elif PHASE == "answer":
         _advance_to_reveal()
-        return jsonify({"ok": True, "message": "Revealing leaderboard"})
+        return jsonify({"ok": True, "message": "Showing leaderboard"})
     elif PHASE == "reveal":
         if CURRENT_INDEX + 1 < len(qs):
             CURRENT_INDEX += 1
@@ -484,9 +503,6 @@ def api_admin_reset():
     CURRENT_INDEX = -1
     SUBMITTED = set()
     LAST_SUBMISSION_TS = {}
-    # Keep players but clear scores; or uncomment next two lines to wipe players too
-    # PLAYERS = set()
-    # NAME_INDEX = {}
     SCORES = defaultdict(int, {name: 0 for name in PLAYERS})
     return jsonify({"ok": True, "message": "Reset to lobby"})
 
