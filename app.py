@@ -5,16 +5,9 @@ from collections import defaultdict
 
 app = Flask(__name__)
 
-# Trust OpenShift router proxy headers (so request.is_secure / url scheme works)
+# Trust OpenShift router proxy headers
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.config['PREFERRED_URL_SCHEME'] = 'https'
-
-# OPTIONAL: belt-and-braces HTTPS redirect if needed (Route already redirects http->https)
-# Uncomment to enforce within app as well.
-# @app.before_request
-# def _force_https():
-#     if request.headers.get('X-Forwarded-Proto', 'http') != 'https':
-#         return redirect(request.url.replace('http://', 'https://', 1), code=308)
 
 # === In-memory state (pod-local). ===
 PLAYERS = set()                 # canonical display names
@@ -69,15 +62,6 @@ def normalize_name(name: str) -> str:
         return ""
     return name
 
-def to_canonical(submitted_name: str):
-    name = normalize_name(submitted_name)
-    if not name:
-        return False, "Invalid name"
-    lower = name.casefold()
-    if lower in NAME_INDEX:
-        return True, NAME_INDEX[lower]
-    return False, "Please register first"
-
 def ensure_unique_on_register(requested_name: str):
     nm = normalize_name(requested_name)
     if not nm:
@@ -86,6 +70,10 @@ def ensure_unique_on_register(requested_name: str):
     if lower in NAME_INDEX:
         return False, "That name is already taken. Please pick a different name."
     return True, nm
+
+def bump_session():
+    global QUIZ_SESSION
+    QUIZ_SESSION = str(int(time.time()*1000))
 
 def score_current_question_once():
     """Award +1 to players whose *last* submitted answer matches the correct answer.
@@ -119,10 +107,6 @@ def clear_leaderboard_snapshot():
     LB_ROWS_SNAPSHOT = []
     LB_WINNERS_SNAPSHOT = []
     LB_MAX_SNAPSHOT = 0
-
-def bump_session():
-    global QUIZ_SESSION
-    QUIZ_SESSION = str(int(time.time()*1000))
 
 def admin_logged_in():
     return session.get('is_admin') is True
@@ -206,10 +190,16 @@ function val(id){ return el(id).value.trim(); }
 async function register(){
   const name = val('player');
   el('regError').textContent = '';
-  const r = await fetch('/api/register',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})});
+  const prev = localStorage.getItem('quiz_name') || null; // send previous for rename support
+  const r = await fetch('/api/register',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name, prev})
+  });
   const data = await r.json().catch(()=>({}));
   if(r.ok && data.ok){
     localStorage.setItem('quiz_name', name);
+    myName = name;
     const badge = el('regStatus');
     badge.style.display='inline-block';
     badge.className='badge ok';
@@ -498,7 +488,8 @@ LOGIN_HTML = """
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 48px; }
     .box { max-width: 380px; margin: 0 auto; border: 1px solid #ddd; border-radius: 10px; padding: 18px; }
-    input, button { padding: 10px 14px; border-radius:8px; border:1px solid #ccc; width:100%; }
+    .box * { box-sizing: border-box; } /* ensure inputs don't overflow card */
+    input, button { padding: 10px 14px; border-radius:8px; border:1px solid #ccc; width:100%; display:block; }
     button { border:0; cursor:pointer; background:#ee0000; color:#fff; margin-top:10px; }
     .err { color:#b00020; margin-top:8px; font-size: 90%; }
     h2 { margin: 0 0 10px 0; }
@@ -546,18 +537,68 @@ def admin_logout():
 
 @app.route("/api/register", methods=["POST"])
 def api_register():
-    """Register a unique player name (case-insensitive)."""
-    global PLAYERS, NAME_INDEX, SCORES
+    """
+    Register or RENAME a unique player (case-insensitive).
+    - While in LOBBY: allow rename from 'prev' -> 'name' if unique.
+    - After start: block renames; allow registering new names (for latecomers) if unique.
+    """
+    global PLAYERS, NAME_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS, LAST_SUBMISSION_TS
     payload = request.get_json(force=True)
     requested = (payload.get("name") or "")
-    ok, msg_or_name = ensure_unique_on_register(requested)
-    if not ok:
-        return jsonify({"ok": False, "message": msg_or_name}), 400
-    canonical = msg_or_name
-    lower = canonical.casefold()
-    PLAYERS.add(canonical)
-    NAME_INDEX[lower] = canonical
-    SCORES[canonical] = SCORES[canonical]
+    prev = (payload.get("prev") or "").strip() or None
+
+    # Normalize targets
+    new_norm = normalize_name(requested)
+    if not new_norm:
+        return jsonify({"ok": False, "message": "Name required"}), 400
+    new_lower = new_norm.casefold()
+
+    # If prev provided & exists -> possible rename flow
+    if prev:
+        prev_norm = normalize_name(prev)
+        prev_lower = prev_norm.casefold() if prev_norm else ""
+        prev_exists = prev_lower in NAME_INDEX
+
+        # If it's actually the same name (case-insensitive), just ack
+        if prev_exists and prev_lower == new_lower:
+            return jsonify({"ok": True})
+
+        # Renaming allowed only before quiz starts
+        if PHASE != "lobby":
+            return jsonify({"ok": False, "message": "Quiz already started — name changes are locked."}), 400
+
+        # Ensure the new name is free (cannot collide with someone else)
+        if new_lower in NAME_INDEX:
+            return jsonify({"ok": False, "message": "That name is already taken. Please pick a different name."}), 400
+
+        # If prev exists, migrate state to new canonical name
+        if prev_exists:
+            old_canon = NAME_INDEX.pop(prev_lower)
+            if old_canon in PLAYERS:
+                PLAYERS.remove(old_canon)
+            # Move score (probably zero in lobby, but safe)
+            old_score = SCORES.pop(old_canon, 0)
+
+            # Add new canonical
+            PLAYERS.add(new_norm)
+            NAME_INDEX[new_lower] = new_norm
+            SCORES[new_norm] = old_score
+
+            # Clean any residual per-question caches for old_canon (should be empty in lobby)
+            SUBMITTED.discard(old_canon)
+            CURRENT_ANSWERS.pop(old_canon, None)
+            LAST_SUBMISSION_TS.pop(old_canon, None)
+
+            return jsonify({"ok": True})
+        # If prev not found, fall through to "new registration" logic below.
+
+    # New registration (or updating same name with no prev)
+    if new_lower in NAME_INDEX:
+        # If they try to "re-register" exact same name, just OK
+        return jsonify({"ok": True})
+    PLAYERS.add(new_norm)
+    NAME_INDEX[new_lower] = new_norm
+    SCORES[new_norm] = SCORES[new_norm]
     return jsonify({"ok": True})
 
 @app.route("/api/state")
@@ -614,10 +655,12 @@ def api_submit():
         return jsonify({"accepted": False, "message": "Not accepting answers now"}), 400
 
     payload = request.get_json(force=True)
-    ok, canon_or_msg = to_canonical(payload.get("name"))
-    if not ok:
-        return jsonify({"accepted": False, "message": canon_or_msg}), 400
-    canonical = canon_or_msg
+    name = (payload.get("name") or "").strip()
+    # Resolve to canonical (must be registered)
+    lower = normalize_name(name).casefold() if name else ""
+    if lower not in NAME_INDEX:
+        return jsonify({"accepted": False, "message": "Please register first"}), 400
+    canonical = NAME_INDEX[lower]
 
     now = time.time()
     if canonical in LAST_SUBMISSION_TS and (now - LAST_SUBMISSION_TS[canonical] < 0.3):
