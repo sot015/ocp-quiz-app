@@ -148,7 +148,7 @@ INDEX_HTML = """
 <body>
 <div class="container">
   <h1>☸️ OpenShift Quiz</h1>
-  <p class="muted">Register once, then answer questions one-by-one when the facilitator advances.</p>
+  <p class="muted">Welcome! Register once, then answer questions one-by-one when the facilitator advances.</p>
 
   <div class="card">
     <div class="grid">
