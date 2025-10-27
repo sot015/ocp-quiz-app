@@ -1,8 +1,20 @@
-from flask import Flask, jsonify, request, render_template_string, abort
+from flask import Flask, jsonify, request, render_template_string, abort, redirect, url_for, session
+from werkzeug.middleware.proxy_fix import ProxyFix
 import yaml, os, time, re
 from collections import defaultdict
 
 app = Flask(__name__)
+
+# Trust OpenShift router proxy headers (so request.is_secure / url scheme works)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.config['PREFERRED_URL_SCHEME'] = 'https'
+
+# OPTIONAL: belt-and-braces HTTPS redirect if needed (Route already redirects http->https)
+# Uncomment to enforce within app as well.
+# @app.before_request
+# def _force_https():
+#     if request.headers.get('X-Forwarded-Proto', 'http') != 'https':
+#         return redirect(request.url.replace('http://', 'https://', 1), code=308)
 
 # === In-memory state (pod-local). ===
 PLAYERS = set()                 # canonical display names
@@ -22,10 +34,12 @@ LB_ROWS_SNAPSHOT = []           # [{"name":..., "score":...}, ...]
 LB_WINNERS_SNAPSHOT = []        # [names]
 LB_MAX_SNAPSHOT = 0
 
-# NEW: session identifier (bumps on Start and Reset)
+# Quiz session id (changes on Start/Reset) to prevent client auto-select carryover
 QUIZ_SESSION = str(int(time.time()))
 
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+# Admin auth (session-based)
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
 
 # ----------------------- helpers -----------------------
 
@@ -74,7 +88,8 @@ def ensure_unique_on_register(requested_name: str):
     return True, nm
 
 def score_current_question_once():
-    """Award +1 to players whose *last* submitted answer matches the correct answer."""
+    """Award +1 to players whose *last* submitted answer matches the correct answer.
+       Runs exactly once per question (on transition to 'answer')."""
     global LAST_SCORED_INDEX
     if CURRENT_INDEX == -1 or CURRENT_INDEX == LAST_SCORED_INDEX:
         return
@@ -108,6 +123,13 @@ def clear_leaderboard_snapshot():
 def bump_session():
     global QUIZ_SESSION
     QUIZ_SESSION = str(int(time.time()*1000))
+
+def admin_logged_in():
+    return session.get('is_admin') is True
+
+def _require_admin():
+    if not admin_logged_in():
+        abort(403)
 
 # ----------------------- HTML (user) -----------------------
 
@@ -168,14 +190,14 @@ INDEX_HTML = """
     <span class="muted">Auto-refreshes every 2s.</span>
   </div>
 
-  <p class="muted">Facilitator controls at <code>/admin?token=YOUR_ADMIN_TOKEN</code>.</p>
+  <p class="muted">Facilitator controls at <code>/admin</code>.</p>
 </div>
 
 <script>
 let state = null;
 let myName = localStorage.getItem('quiz_name') || '';
-let lastRenderKey = ""; // phase:index
-let currentSession = null;      // NEW: session from server
+let lastRenderKey = ""; // session:phase:index
+let currentSession = null;
 let lastSession = localStorage.getItem('quiz_session') || null;
 
 function el(id){ return document.getElementById(id); }
@@ -197,18 +219,17 @@ async function register(){
   }
 }
 
-function lsKeyFor(session, idx){ return 'ans_'+session+'_'+idx; } // NEW: session-scoped
+function lsKeyFor(session, idx){ return 'ans_'+session+'_'+idx; }
 
 async function loadState(){
   const r = await fetch('/api/state');
   state = await r.json();
-  // NEW: handle session switch
+  // Session switch handling
   currentSession = state.session;
   if(currentSession && currentSession !== lastSession){
-    // remember newest session; do NOT reuse old answers automatically
     localStorage.setItem('quiz_session', currentSession);
     lastSession = currentSession;
-    lastRenderKey = ""; // force rerender of panels for new session
+    lastRenderKey = ""; // force re-render
   }
   renderState();
 }
@@ -240,7 +261,7 @@ function renderQuestion(readonly){
     ${Q.note ? `<div class="muted" style="margin-top:8px;">💡 ${Q.note}</div>` : ''}
   `;
 
-  // Ensure nothing pre-selected by browser restore
+  // Ensure no default selection; restore only user's own choice in question phase
   Array.from(qc.querySelectorAll('input[name="opt"]')).forEach(r => { r.checked = false; });
   if(!readonly && savedIdx !== null){
     const toCheck = qc.querySelector('input[name="opt"][value="'+savedIdx+'"]');
@@ -259,7 +280,7 @@ function renderState(){
     Question ${state.current_index >= 0 ? state.current_index+1 : 0} / ${state.total_questions} ·
     Players: ${state.players_count} · Submissions: ${state.submissions_count}`;
 
-  const currentKey = `${state.session}:${state.phase}:${state.current_index}`; // NEW: session in key
+  const currentKey = `${state.session}:${state.phase}:${state.current_index}`;
 
   if(state.phase === 'lobby'){
     qc.style.display='none';
@@ -340,7 +361,7 @@ async function loadLeaderboard(final){
   const winners = data.winners || [];
   const max = data.max_score ?? 0;
   lb.innerHTML = `<h3>${final ? 'Final ' : ''}Leaderboard</h3>` +
-    data.rows.map((row, i) => {
+    (data.rows || []).map((row, i) => {
       const cls = winners.includes(row.name) && final ? 'winner' : '';
       return `<div class="${cls}">${i+1}. <strong>${row.name}</strong> — ${row.score}${final && winners.includes(row.name) ? ' 🏆' : ''}</div>`;
     }).join('') || '<em>No scores yet.</em>';
@@ -372,6 +393,7 @@ ADMIN_HTML = """
     .correct { outline: 2px solid #198754; border-radius: 6px; padding: 2px 6px; }
     .status { margin-top:8px; font-size: 90%; color:#333; }
     .muted { color:#555; }
+    a.small { font-size: 90%; margin-left: 8px; }
   </style>
 </head>
 <body>
@@ -383,6 +405,7 @@ ADMIN_HTML = """
     <button class="primary" onclick="post('/api/admin/start')">Start</button>
     <button class="secondary" onclick="post('/api/admin/advance')">Advance</button>
     <button onclick="post('/api/admin/reset')">Reset</button>
+    <a class="small" href="/admin/logout">Logout</a>
     <div id="status" class="status muted">Ready.</div>
   </div>
 
@@ -394,14 +417,13 @@ ADMIN_HTML = """
   </div>
 
 <script>
-const token = new URLSearchParams(location.search).get('token') || '';
 let adminPhase = 'lobby';
 let adminSession = null;
 
 async function post(url){
   const statusEl = document.getElementById('status');
   try{
-    const r = await fetch(url+'?token='+encodeURIComponent(token), {method:'POST'});
+    const r = await fetch(url, {method:'POST'});
     const data = await r.json();
     await loadEverything();
     statusEl.textContent = (data && data.message) ? data.message : (r.ok ? 'OK' : 'Error');
@@ -428,7 +450,7 @@ async function loadState(){
 }
 
 async function loadAdminState(){
-  const r = await fetch('/api/admin_state?token='+encodeURIComponent(token));
+  const r = await fetch('/api/admin_state');
   if(!r.ok){ document.getElementById('adminQuestion').innerHTML = '<em>Not authorized or unavailable.</em>'; return; }
   const a = await r.json();
   const q = a.question;
@@ -465,6 +487,36 @@ loadEverything();
 </html>
 """
 
+# ----------------------- HTML (admin login) -----------------------
+
+LOGIN_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Admin Login</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 48px; }
+    .box { max-width: 380px; margin: 0 auto; border: 1px solid #ddd; border-radius: 10px; padding: 18px; }
+    input, button { padding: 10px 14px; border-radius:8px; border:1px solid #ccc; width:100%; }
+    button { border:0; cursor:pointer; background:#ee0000; color:#fff; margin-top:10px; }
+    .err { color:#b00020; margin-top:8px; font-size: 90%; }
+    h2 { margin: 0 0 10px 0; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>Admin Login</h2>
+    <form method="post">
+      <input type="password" name="password" placeholder="Password">
+      <button type="submit">Login</button>
+      {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    </form>
+  </div>
+</body>
+</html>
+"""
+
 # ----------------------- ROUTES -----------------------
 
 @app.route("/")
@@ -473,9 +525,24 @@ def index():
 
 @app.route("/admin")
 def admin():
-    if ADMIN_TOKEN and request.args.get("token") != ADMIN_TOKEN:
-        return abort(403)
+    if not admin_logged_in():
+        return redirect(url_for("admin_login"))
     return render_template_string(ADMIN_HTML)
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    if request.method == "POST":
+        pw = (request.form.get("password") or "").strip()
+        if ADMIN_PASSWORD and pw == ADMIN_PASSWORD:
+            session['is_admin'] = True
+            return redirect(url_for("admin"))
+        return render_template_string(LOGIN_HTML, error="Invalid password")
+    return render_template_string(LOGIN_HTML, error=None)
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.clear()
+    return redirect(url_for("admin_login"))
 
 @app.route("/api/register", methods=["POST"])
 def api_register():
@@ -502,7 +569,7 @@ def api_state():
     if q:
         q_pub = {"text": q.get("text"), "options": q.get("options", []), "note": q.get("note")}
     return jsonify({
-        "session": QUIZ_SESSION,               # NEW
+        "session": QUIZ_SESSION,
         "phase": PHASE,
         "current_index": CURRENT_INDEX,
         "total_questions": len(qs),
@@ -513,9 +580,7 @@ def api_state():
 
 @app.route("/api/admin_state")
 def api_admin_state():
-    # Detailed for facilitator (includes correct answer)
-    if ADMIN_TOKEN and request.args.get("token") != ADMIN_TOKEN:
-        return abort(403)
+    _require_admin()
     qs = load_questions()
     q = current_question()
     q_pub = None
@@ -527,7 +592,7 @@ def api_admin_state():
         except Exception:
             correct_index = None
     return jsonify({
-        "session": QUIZ_SESSION,               # NEW
+        "session": QUIZ_SESSION,
         "phase": PHASE,
         "current_index": CURRENT_INDEX,
         "total_questions": len(qs),
@@ -583,12 +648,6 @@ def api_leaderboard():
 
 # ----------------- Admin controls -----------------
 
-def _require_admin():
-    if ADMIN_TOKEN and request.args.get("token") == ADMIN_TOKEN:
-        return
-    if ADMIN_TOKEN:
-        abort(403)
-
 def _advance_to_question():
     global PHASE, SUBMITTED, CURRENT_ANSWERS
     PHASE = "question"
@@ -615,7 +674,7 @@ def api_admin_start():
     _require_admin()
     global PHASE, CURRENT_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS, LAST_SCORED_INDEX
     clear_leaderboard_snapshot()
-    bump_session()  # NEW: new session on every start
+    bump_session()  # new session on every start
     qs = load_questions()
     SCORES = defaultdict(int, {name: 0 for name in PLAYERS})
     SUBMITTED = set()
@@ -657,7 +716,6 @@ def api_admin_reset():
     _require_admin()
     global PHASE, CURRENT_INDEX, PLAYERS, NAME_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS
     global LAST_SUBMISSION_TS, LAST_SCORED_INDEX
-    # Clear absolutely everything
     PHASE = "lobby"
     CURRENT_INDEX = -1
     PLAYERS = set()
@@ -668,7 +726,7 @@ def api_admin_reset():
     LAST_SUBMISSION_TS = {}
     LAST_SCORED_INDEX = -1
     clear_leaderboard_snapshot()
-    bump_session()  # NEW: fresh session on reset
+    bump_session()  # fresh session on reset
     return jsonify({"ok": True, "message": "Hard reset complete — players must register again"})
 
 if __name__ == "__main__":
