@@ -142,7 +142,7 @@ INDEX_HTML = """
     .winner { background: #fff3cd; border: 1px solid #ffe69c; padding: 8px; border-radius: 8px; }
     .error { color:#b00020; margin-left:10px; font-size: 90%; }
     .user-choice { outline: 2px solid #0d6efd; border-radius: 6px; padding: 2px 6px; }
-    .disabled { opacity: 0.7; pointer-events: none; }
+    .disabled-note { font-size: 90%; color:#555; margin-left:8px; }
   </style>
 </head>
 <body>
@@ -156,9 +156,10 @@ INDEX_HTML = """
         <input id="player" placeholder="Pods, Operators, Alice..." style="width:100%">
       </label>
       <div>
-        <button class="secondary" onclick="register()">Register / Update name</button>
+        <button id="regBtn" class="secondary" onclick="register()">Register / Update name</button>
         <span id="regStatus" class="badge warn" style="display:none">Registered</span>
         <span id="regError" class="error"></span>
+        <span id="nameLocked" class="disabled-note" style="display:none">Name locked (quiz in progress)</span>
       </div>
     </div>
   </div>
@@ -186,6 +187,12 @@ let lastSession = localStorage.getItem('quiz_session') || null;
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value.trim(); }
+
+function setNameEditable(editable){
+  el('player').disabled = !editable;
+  el('regBtn').disabled = !editable;
+  el('nameLocked').style.display = editable ? 'none' : 'inline';
+}
 
 async function register(){
   const name = val('player');
@@ -269,6 +276,9 @@ function renderState(){
   pc.innerHTML = `<strong>Phase:</strong> ${state.phase.toUpperCase()} ·
     Question ${state.current_index >= 0 ? state.current_index+1 : 0} / ${state.total_questions} ·
     Players: ${state.players_count} · Submissions: ${state.submissions_count}`;
+
+  // NEW: toggle name editability only in lobby
+  setNameEditable(state.phase === 'lobby');
 
   const currentKey = `${state.session}:${state.phase}:${state.current_index}`;
 
@@ -540,7 +550,7 @@ def api_register():
     """
     Register or RENAME a unique player (case-insensitive).
     - While in LOBBY: allow rename from 'prev' -> 'name' if unique.
-    - After start: block renames; allow registering new names (for latecomers) if unique.
+    - After start: block renames; allow registering same name (no-op) but UI prevents changes anyway.
     """
     global PLAYERS, NAME_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS, LAST_SUBMISSION_TS
     payload = request.get_json(force=True)
@@ -576,15 +586,12 @@ def api_register():
             old_canon = NAME_INDEX.pop(prev_lower)
             if old_canon in PLAYERS:
                 PLAYERS.remove(old_canon)
-            # Move score (probably zero in lobby, but safe)
             old_score = SCORES.pop(old_canon, 0)
 
-            # Add new canonical
             PLAYERS.add(new_norm)
             NAME_INDEX[new_lower] = new_norm
             SCORES[new_norm] = old_score
 
-            # Clean any residual per-question caches for old_canon (should be empty in lobby)
             SUBMITTED.discard(old_canon)
             CURRENT_ANSWERS.pop(old_canon, None)
             LAST_SUBMISSION_TS.pop(old_canon, None)
@@ -594,8 +601,7 @@ def api_register():
 
     # New registration (or updating same name with no prev)
     if new_lower in NAME_INDEX:
-        # If they try to "re-register" exact same name, just OK
-        return jsonify({"ok": True})
+        return jsonify({"ok": True})  # no-op if same name already present
     PLAYERS.add(new_norm)
     NAME_INDEX[new_lower] = new_norm
     SCORES[new_norm] = SCORES[new_norm]
@@ -656,7 +662,6 @@ def api_submit():
 
     payload = request.get_json(force=True)
     name = (payload.get("name") or "").strip()
-    # Resolve to canonical (must be registered)
     lower = normalize_name(name).casefold() if name else ""
     if lower not in NAME_INDEX:
         return jsonify({"accepted": False, "message": "Please register first"}), 400
@@ -667,14 +672,11 @@ def api_submit():
         return jsonify({"accepted": False, "message": "Slow down"}), 429
     LAST_SUBMISSION_TS[canonical] = now
 
-    # Store last answer (resubmits overwrite)
     answer = payload.get("answer", None)
     CURRENT_ANSWERS[canonical] = answer
 
-    # Mark as "has submitted at least once"
     SUBMITTED.add(canonical)
 
-    # Auto-advance to ANSWER (locks submissions) when everyone has submitted at least once
     if len(PLAYERS) > 0 and len(SUBMITTED) >= len(PLAYERS):
         _advance_to_answer()
 
