@@ -7,12 +7,20 @@ app = Flask(__name__)
 # === In-memory state (pod-local). ===
 PLAYERS = set()                 # canonical display names
 NAME_INDEX = {}                 # lowercased -> canonical
-SCORES = defaultdict(int)       # canonical -> score
-SUBMITTED = set()               # canonical submitted this question
-CURRENT_ANSWERS = {}            # canonical -> selected option index (or None)
+SCORES = defaultdict(int)       # canonical -> score (cumulative)
+SUBMITTED = set()               # canonical submitted at least once for current question
+CURRENT_ANSWERS = {}            # canonical -> last selected option index (or None) for current question
 LAST_SUBMISSION_TS = {}         # canonical -> float
 PHASE = "lobby"                 # lobby | question | answer | reveal | final
 CURRENT_INDEX = -1              # -1 in lobby; 0..N-1 during quiz
+
+# Score-once guard
+LAST_SCORED_INDEX = -1
+
+# Leaderboard snapshot (only updated on reveal/final)
+LB_ROWS_SNAPSHOT = []           # list of dicts [{"name":..., "score":...}, ...]
+LB_WINNERS_SNAPSHOT = []        # list of names
+LB_MAX_SNAPSHOT = 0
 
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
@@ -30,7 +38,7 @@ def current_question():
         return qs[CURRENT_INDEX]
     return None
 
-def winners():
+def winners_from_scores():
     if not SCORES:
         return [], 0
     mx = max(SCORES.values())
@@ -62,7 +70,40 @@ def ensure_unique_on_register(requested_name: str):
         return False, "That name is already taken. Please pick a different name."
     return True, nm
 
-# ----------------------- HTML -----------------------
+def score_current_question_once():
+    """Award +1 to players whose *last* submitted answer matches the correct answer.
+       Runs exactly once per question (on transition to 'answer')."""
+    global LAST_SCORED_INDEX
+    if CURRENT_INDEX == -1 or CURRENT_INDEX == LAST_SCORED_INDEX:
+        return
+    q = current_question()
+    if not q:
+        LAST_SCORED_INDEX = CURRENT_INDEX
+        return
+    correct_idx = q.get("answer", None)
+    if correct_idx is None:
+        LAST_SCORED_INDEX = CURRENT_INDEX
+        return
+    for name in PLAYERS:
+        ans = CURRENT_ANSWERS.get(name, None)
+        if ans == correct_idx:
+            SCORES[name] += 1
+    LAST_SCORED_INDEX = CURRENT_INDEX
+
+def snapshot_leaderboard():
+    """Create a snapshot of the leaderboard (used only in reveal/final)."""
+    global LB_ROWS_SNAPSHOT, LB_WINNERS_SNAPSHOT, LB_MAX_SNAPSHOT
+    rows = sorted(SCORES.items(), key=lambda kv: kv[1], reverse=True)
+    LB_ROWS_SNAPSHOT = [{"name": k, "score": v} for k, v in rows]
+    LB_WINNERS_SNAPSHOT, LB_MAX_SNAPSHOT = winners_from_scores()
+
+def clear_leaderboard_snapshot():
+    global LB_ROWS_SNAPSHOT, LB_WINNERS_SNAPSHOT, LB_MAX_SNAPSHOT
+    LB_ROWS_SNAPSHOT = []
+    LB_WINNERS_SNAPSHOT = []
+    LB_MAX_SNAPSHOT = 0
+
+# ----------------------- HTML (user) -----------------------
 
 INDEX_HTML = """
 <!doctype html>
@@ -162,7 +203,6 @@ function renderQuestion(readonly){
   if(!Q){ qc.style.display='none'; return; }
   qc.style.display='block';
 
-  // user's previously submitted answer for this question (from localStorage)
   const savedAns = localStorage.getItem(lsKeyFor(state.current_index));
   const savedIdx = savedAns !== null ? parseInt(savedAns) : null;
 
@@ -184,9 +224,7 @@ function renderQuestion(readonly){
     ${Q.note ? `<div class="muted" style="margin-top:8px;">💡 ${Q.note}</div>` : ''}
   `;
 
-  // Nothing selected by default; explicitly ensure radios start unchecked.
   Array.from(qc.querySelectorAll('input[name="opt"]')).forEach(r => { r.checked = false; });
-  // If user had an answer and we're still in question phase, pre-check it for convenience
   if(!readonly && savedIdx !== null){
     const toCheck = qc.querySelector('input[name="opt"][value="'+savedIdx+'"]');
     if(toCheck) toCheck.checked = true;
@@ -215,14 +253,14 @@ function renderState(){
 
   if(state.phase === 'question'){
     if(currentKey !== lastRenderKey){
-      renderQuestion(false); // answerable
+      renderQuestion(false);
       lb.style.display='none';
       lastRenderKey = currentKey;
     }
     return;
   }
 
-  if(state.phase === 'answer'){ // show user's own answer highlighted, inputs locked
+  if(state.phase === 'answer'){
     if(currentKey !== lastRenderKey){
       renderQuestion(true);
       lb.style.display='none';
@@ -231,7 +269,7 @@ function renderState(){
     return;
   }
 
-  if(state.phase === 'reveal'){ // leaderboard
+  if(state.phase === 'reveal'){
     if(currentKey !== lastRenderKey){
       qc.style.display='none';
       loadLeaderboard(false);
@@ -262,18 +300,11 @@ async function submitAnswer(){
   });
   const data = await r.json();
   const s = el('submitStatus');
-  // No "correct!" message — if accepted, either show neutral Saved (if wrong) or nothing (if correct)
   if(r.ok && data.accepted){
-    // persist my answer for highlight across phases/page refresh
     if(chosen){ localStorage.setItem(lsKeyFor(state.current_index), String(answer)); }
-    if(data.correct){
-      s.style.display='none';
-    }else{
-      s.style.display='inline-block';
-      s.className='badge warn';
-      s.textContent = 'Saved';
-    }
-    // re-render to apply highlight class immediately
+    s.style.display='inline-block';
+    s.className='badge warn';
+    s.textContent = 'Saved';
     renderQuestion(false);
   } else {
     s.style.display='inline-block';
@@ -293,8 +324,7 @@ async function loadLeaderboard(final){
     data.rows.map((row, i) => {
       const cls = winners.includes(row.name) && final ? 'winner' : '';
       return `<div class="${cls}">${i+1}. <strong>${row.name}</strong> — ${row.score}${final && winners.includes(row.name) ? ' 🏆' : ''}</div>`;
-    }).join('') +
-    (final && winners.length ? `<div style="margin-top:10px;"><strong>Winner${winners.length>1?'s':''}:</strong> ${winners.join(', ')} (score ${max})</div>` : '');
+    }).join('') || '<em>No scores yet.</em>';
 }
 
 function refresh(){ loadState(); }
@@ -304,6 +334,8 @@ loadState();
 </body>
 </html>
 """
+
+# ----------------------- HTML (admin) -----------------------
 
 ADMIN_HTML = """
 <!doctype html>
@@ -338,12 +370,13 @@ ADMIN_HTML = """
   <div class="card" id="adminQuestion"></div>
 
   <div class="card">
-    <div>Leaderboard (use below for reveal/final)</div>
+    <div>Leaderboard</div>
     <div id="adminLeaderboard" class="muted">Waiting…</div>
   </div>
 
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
+let adminPhase = 'lobby';
 
 async function post(url){
   const statusEl = document.getElementById('status');
@@ -358,15 +391,20 @@ async function post(url){
 }
 
 async function loadEverything(){
-  await Promise.all([loadState(), loadAdminState(), loadLeaderboard()]);
+  await Promise.all([loadState(), loadAdminState(), maybeLoadLeaderboard()]);
 }
 
 async function loadState(){
   const r = await fetch('/api/state');
   const s = await r.json();
+  adminPhase = s.phase;
   document.getElementById('state').innerHTML =
     `<div><strong>Phase:</strong> ${s.phase.toUpperCase()} · Q ${s.current_index>=0?s.current_index+1:0}/${s.total_questions}</div>
      <div><strong>Players:</strong> ${s.players_count} · <strong>Submissions:</strong> ${s.submissions_count}</div>`;
+  // If not in reveal/final, show placeholder for leaderboard
+  if(!(adminPhase === 'reveal' || adminPhase === 'final')){
+    document.getElementById('adminLeaderboard').innerHTML = '<em>Waiting for reveal…</em>';
+  }
 }
 
 async function loadAdminState(){
@@ -376,7 +414,6 @@ async function loadAdminState(){
   const q = a.question;
   if(!q){ document.getElementById('adminQuestion').innerHTML = '<em>No question loaded.</em>'; return; }
 
-  // Show question and mark correct answer ONLY during ANSWER phase
   let opts = q.options.map((o,i)=>{
     const cls = (a.phase === 'answer' && a.correct_answer_index === i) ? 'correct' : '';
     return `<div class="${cls}" style="margin:4px 0;">${i+1}. ${o}</div>`;
@@ -388,14 +425,15 @@ async function loadAdminState(){
      <div style="margin-top:8px;">${opts}</div>`;
 }
 
-async function loadLeaderboard(){
+async function maybeLoadLeaderboard(){
+  if(!(adminPhase === 'reveal' || adminPhase === 'final')) return;
   const r = await fetch('/api/leaderboard');
   const data = await r.json();
   const winners = data.winners || [];
   const max = data.max_score ?? 0;
   document.getElementById('adminLeaderboard').innerHTML =
-    data.rows.map((row, i) => {
-      const crown = (winners.includes(row.name) && (max>0) && document.getElementById('state').innerText.includes('FINAL')) ? ' 🏆' : '';
+    (data.rows && data.rows.length ? data.rows : []).map((row, i) => {
+      const crown = (adminPhase === 'final' && winners.includes(row.name)) ? ' 🏆' : '';
       return `<div>${i+1}. <strong>${row.name}</strong> — ${row.score}${crown}</div>`;
     }).join('') || '<em>No scores yet.</em>';
 }
@@ -437,7 +475,7 @@ def api_register():
 
 @app.route("/api/state")
 def api_state():
-    # Public state for participants (NO CORRECT ANSWER LEAKED)
+    # Public state for participants (NO CORRECT ANSWER)
     qs = load_questions()
     q = current_question()
     q_pub = None
@@ -454,7 +492,7 @@ def api_state():
 
 @app.route("/api/admin_state")
 def api_admin_state():
-    # Detailed state for facilitator (includes correct answer)
+    # Detailed for facilitator (includes correct answer)
     if ADMIN_TOKEN and request.args.get("token") != ADMIN_TOKEN:
         return abort(403)
     qs = load_questions()
@@ -479,10 +517,15 @@ def api_admin_state():
 
 @app.route("/api/submit", methods=["POST"])
 def api_submit():
-    """Accept one answer per player for current question. Correct=+1, wrong/missing=0."""
+    """
+    Accept answers during QUESTION phase.
+    Users may resubmit; we keep the last answer.
+    Scoring is deferred to transition to ANSWER.
+    """
     global SUBMITTED, CURRENT_ANSWERS
     if PHASE != "question":
         return jsonify({"accepted": False, "message": "Not accepting answers now"}), 400
+
     payload = request.get_json(force=True)
     ok, canon_or_msg = to_canonical(payload.get("name"))
     if not ok:
@@ -490,38 +533,35 @@ def api_submit():
     canonical = canon_or_msg
 
     now = time.time()
-    if canonical in LAST_SUBMISSION_TS and (now - LAST_SUBMISSION_TS[canonical] < 0.8):
+    if canonical in LAST_SUBMISSION_TS and (now - LAST_SUBMISSION_TS[canonical] < 0.3):
         return jsonify({"accepted": False, "message": "Slow down"}), 429
     LAST_SUBMISSION_TS[canonical] = now
 
-    if canonical in SUBMITTED:
-        return jsonify({"accepted": False, "message": "Already submitted"}), 200
-
-    q = current_question()
+    # Store last answer (resubmits overwrite)
     answer = payload.get("answer", None)
     CURRENT_ANSWERS[canonical] = answer
 
-    correct = False
-    try:
-        if answer == q["answer"]:
-            correct = True
-            SCORES[canonical] += 1
-    except Exception:
-        pass
-
+    # Mark as "has submitted at least once"
     SUBMITTED.add(canonical)
 
-    # Auto-advance to ANSWER (show correct on admin) when everyone submitted
+    # Auto-advance to ANSWER (locks submissions) when everyone has submitted at least once
     if len(PLAYERS) > 0 and len(SUBMITTED) >= len(PLAYERS):
         _advance_to_answer()
 
-    return jsonify({"accepted": True, "correct": correct})
+    return jsonify({"accepted": True})
 
 @app.route("/api/leaderboard")
 def api_leaderboard():
-    rows = sorted(SCORES.items(), key=lambda kv: kv[1], reverse=True)
-    win, mx = winners()
-    return jsonify({"rows": [{"name": k, "score": v} for k, v in rows], "winners": win, "max_score": mx})
+    """
+    Returns the leaderboard snapshot.
+    It only updates when we move to REVEAL or FINAL.
+    During QUESTION/ANSWER phases, this endpoint returns the last snapshot.
+    """
+    return jsonify({
+        "rows": LB_ROWS_SNAPSHOT,
+        "winners": LB_WINNERS_SNAPSHOT,
+        "max_score": LB_MAX_SNAPSHOT
+    })
 
 # ----------------- Admin controls -----------------
 
@@ -539,26 +579,34 @@ def _advance_to_question():
 
 def _advance_to_answer():
     global PHASE
+    # lock and score once
+    score_current_question_once()
     PHASE = "answer"
 
 def _advance_to_reveal():
     global PHASE
     PHASE = "reveal"
+    snapshot_leaderboard()
 
 def _advance_to_final():
     global PHASE
     PHASE = "final"
+    snapshot_leaderboard()
 
 @app.route("/api/admin/start", methods=["POST"])
 def api_admin_start():
     _require_admin()
-    global PHASE, CURRENT_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS
+    global PHASE, CURRENT_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS, LAST_SCORED_INDEX
+    clear_leaderboard_snapshot()
     qs = load_questions()
     SCORES = defaultdict(int, {name: 0 for name in PLAYERS})
     SUBMITTED = set()
     CURRENT_ANSWERS = {}
+    LAST_SCORED_INDEX = -1
     CURRENT_INDEX = 0 if len(qs) > 0 else -1
     PHASE = "question" if CURRENT_INDEX >= 0 else "final"
+    if PHASE == "final":
+        snapshot_leaderboard()
     return jsonify({"ok": True, "message": "Quiz started"})
 
 @app.route("/api/admin/advance", methods=["POST"])
@@ -587,15 +635,22 @@ def api_admin_advance():
 
 @app.route("/api/admin/reset", methods=["POST"])
 def api_admin_reset():
+    """Hard reset: requires users to register again."""
     _require_admin()
-    global PHASE, CURRENT_INDEX, PLAYERS, NAME_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS, LAST_SUBMISSION_TS
+    global PHASE, CURRENT_INDEX, PLAYERS, NAME_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS
+    global LAST_SUBMISSION_TS, LAST_SCORED_INDEX
+    # Clear absolutely everything
     PHASE = "lobby"
     CURRENT_INDEX = -1
+    PLAYERS = set()
+    NAME_INDEX = {}
+    SCORES = defaultdict(int)
     SUBMITTED = set()
     CURRENT_ANSWERS = {}
     LAST_SUBMISSION_TS = {}
-    SCORES = defaultdict(int, {name: 0 for name in PLAYERS})
-    return jsonify({"ok": True, "message": "Reset to lobby"})
+    LAST_SCORED_INDEX = -1
+    clear_leaderboard_snapshot()
+    return jsonify({"ok": True, "message": "Hard reset complete — players must register again"})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
