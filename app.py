@@ -18,9 +18,12 @@ CURRENT_INDEX = -1              # -1 in lobby; 0..N-1 during quiz
 LAST_SCORED_INDEX = -1
 
 # Leaderboard snapshot (only updated on reveal/final)
-LB_ROWS_SNAPSHOT = []           # list of dicts [{"name":..., "score":...}, ...]
-LB_WINNERS_SNAPSHOT = []        # list of names
+LB_ROWS_SNAPSHOT = []           # [{"name":..., "score":...}, ...]
+LB_WINNERS_SNAPSHOT = []        # [names]
 LB_MAX_SNAPSHOT = 0
+
+# NEW: session identifier (bumps on Start and Reset)
+QUIZ_SESSION = str(int(time.time()))
 
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
@@ -71,8 +74,7 @@ def ensure_unique_on_register(requested_name: str):
     return True, nm
 
 def score_current_question_once():
-    """Award +1 to players whose *last* submitted answer matches the correct answer.
-       Runs exactly once per question (on transition to 'answer')."""
+    """Award +1 to players whose *last* submitted answer matches the correct answer."""
     global LAST_SCORED_INDEX
     if CURRENT_INDEX == -1 or CURRENT_INDEX == LAST_SCORED_INDEX:
         return
@@ -102,6 +104,10 @@ def clear_leaderboard_snapshot():
     LB_ROWS_SNAPSHOT = []
     LB_WINNERS_SNAPSHOT = []
     LB_MAX_SNAPSHOT = 0
+
+def bump_session():
+    global QUIZ_SESSION
+    QUIZ_SESSION = str(int(time.time()*1000))
 
 # ----------------------- HTML (user) -----------------------
 
@@ -169,6 +175,8 @@ INDEX_HTML = """
 let state = null;
 let myName = localStorage.getItem('quiz_name') || '';
 let lastRenderKey = ""; // phase:index
+let currentSession = null;      // NEW: session from server
+let lastSession = localStorage.getItem('quiz_session') || null;
 
 function el(id){ return document.getElementById(id); }
 function val(id){ return el(id).value.trim(); }
@@ -189,11 +197,19 @@ async function register(){
   }
 }
 
-function lsKeyFor(idx){ return 'ans_q_'+idx; }
+function lsKeyFor(session, idx){ return 'ans_'+session+'_'+idx; } // NEW: session-scoped
 
 async function loadState(){
   const r = await fetch('/api/state');
   state = await r.json();
+  // NEW: handle session switch
+  currentSession = state.session;
+  if(currentSession && currentSession !== lastSession){
+    // remember newest session; do NOT reuse old answers automatically
+    localStorage.setItem('quiz_session', currentSession);
+    lastSession = currentSession;
+    lastRenderKey = ""; // force rerender of panels for new session
+  }
   renderState();
 }
 
@@ -203,7 +219,7 @@ function renderQuestion(readonly){
   if(!Q){ qc.style.display='none'; return; }
   qc.style.display='block';
 
-  const savedAns = localStorage.getItem(lsKeyFor(state.current_index));
+  const savedAns = currentSession ? localStorage.getItem(lsKeyFor(currentSession, state.current_index)) : null;
   const savedIdx = savedAns !== null ? parseInt(savedAns) : null;
 
   const opts = Q.options.map((o,i)=>{
@@ -224,6 +240,7 @@ function renderQuestion(readonly){
     ${Q.note ? `<div class="muted" style="margin-top:8px;">💡 ${Q.note}</div>` : ''}
   `;
 
+  // Ensure nothing pre-selected by browser restore
   Array.from(qc.querySelectorAll('input[name="opt"]')).forEach(r => { r.checked = false; });
   if(!readonly && savedIdx !== null){
     const toCheck = qc.querySelector('input[name="opt"][value="'+savedIdx+'"]');
@@ -242,7 +259,7 @@ function renderState(){
     Question ${state.current_index >= 0 ? state.current_index+1 : 0} / ${state.total_questions} ·
     Players: ${state.players_count} · Submissions: ${state.submissions_count}`;
 
-  const currentKey = `${state.phase}:${state.current_index}`;
+  const currentKey = `${state.session}:${state.phase}:${state.current_index}`; // NEW: session in key
 
   if(state.phase === 'lobby'){
     qc.style.display='none';
@@ -301,7 +318,9 @@ async function submitAnswer(){
   const data = await r.json();
   const s = el('submitStatus');
   if(r.ok && data.accepted){
-    if(chosen){ localStorage.setItem(lsKeyFor(state.current_index), String(answer)); }
+    if(chosen && currentSession){
+      localStorage.setItem(lsKeyFor(currentSession, state.current_index), String(answer));
+    }
     s.style.display='inline-block';
     s.className='badge warn';
     s.textContent = 'Saved';
@@ -377,6 +396,7 @@ ADMIN_HTML = """
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
 let adminPhase = 'lobby';
+let adminSession = null;
 
 async function post(url){
   const statusEl = document.getElementById('status');
@@ -398,10 +418,10 @@ async function loadState(){
   const r = await fetch('/api/state');
   const s = await r.json();
   adminPhase = s.phase;
+  adminSession = s.session;
   document.getElementById('state').innerHTML =
-    `<div><strong>Phase:</strong> ${s.phase.toUpperCase()} · Q ${s.current_index>=0?s.current_index+1:0}/${s.total_questions}</div>
+    `<div><strong>Session:</strong> ${adminSession} · <strong>Phase:</strong> ${s.phase.toUpperCase()} · Q ${s.current_index>=0?s.current_index+1:0}/${s.total_questions}</div>
      <div><strong>Players:</strong> ${s.players_count} · <strong>Submissions:</strong> ${s.submissions_count}</div>`;
-  // If not in reveal/final, show placeholder for leaderboard
   if(!(adminPhase === 'reveal' || adminPhase === 'final')){
     document.getElementById('adminLeaderboard').innerHTML = '<em>Waiting for reveal…</em>';
   }
@@ -482,6 +502,7 @@ def api_state():
     if q:
         q_pub = {"text": q.get("text"), "options": q.get("options", []), "note": q.get("note")}
     return jsonify({
+        "session": QUIZ_SESSION,               # NEW
         "phase": PHASE,
         "current_index": CURRENT_INDEX,
         "total_questions": len(qs),
@@ -506,6 +527,7 @@ def api_admin_state():
         except Exception:
             correct_index = None
     return jsonify({
+        "session": QUIZ_SESSION,               # NEW
         "phase": PHASE,
         "current_index": CURRENT_INDEX,
         "total_questions": len(qs),
@@ -552,11 +574,7 @@ def api_submit():
 
 @app.route("/api/leaderboard")
 def api_leaderboard():
-    """
-    Returns the leaderboard snapshot.
-    It only updates when we move to REVEAL or FINAL.
-    During QUESTION/ANSWER phases, this endpoint returns the last snapshot.
-    """
+    """Returns the leaderboard SNAPSHOT (only refreshed in reveal/final)."""
     return jsonify({
         "rows": LB_ROWS_SNAPSHOT,
         "winners": LB_WINNERS_SNAPSHOT,
@@ -579,7 +597,6 @@ def _advance_to_question():
 
 def _advance_to_answer():
     global PHASE
-    # lock and score once
     score_current_question_once()
     PHASE = "answer"
 
@@ -598,6 +615,7 @@ def api_admin_start():
     _require_admin()
     global PHASE, CURRENT_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS, LAST_SCORED_INDEX
     clear_leaderboard_snapshot()
+    bump_session()  # NEW: new session on every start
     qs = load_questions()
     SCORES = defaultdict(int, {name: 0 for name in PLAYERS})
     SUBMITTED = set()
@@ -635,7 +653,7 @@ def api_admin_advance():
 
 @app.route("/api/admin/reset", methods=["POST"])
 def api_admin_reset():
-    """Hard reset: requires users to register again."""
+    """Hard reset: requires users to register again and starts a new session."""
     _require_admin()
     global PHASE, CURRENT_INDEX, PLAYERS, NAME_INDEX, SCORES, SUBMITTED, CURRENT_ANSWERS
     global LAST_SUBMISSION_TS, LAST_SCORED_INDEX
@@ -650,6 +668,7 @@ def api_admin_reset():
     LAST_SUBMISSION_TS = {}
     LAST_SCORED_INDEX = -1
     clear_leaderboard_snapshot()
+    bump_session()  # NEW: fresh session on reset
     return jsonify({"ok": True, "message": "Hard reset complete — players must register again"})
 
 if __name__ == "__main__":
